@@ -8,7 +8,12 @@ use toml_edit::{Item, Value};
 
 use crate::{
     cargo::CargoToml,
-    commands::{VersionBump, checker::generate_baseline, release::plan::Plan, update_package},
+    commands::{
+        VersionBump,
+        checker::generate_baseline,
+        release::plan::{PackagePlan, Plan},
+        update_package,
+    },
     git::{current_branch, ensure_workspace_clean, get_remote_name_for},
 };
 
@@ -55,6 +60,33 @@ pub fn execute_plan(workspace: &Path, args: ApplyPlanArgs) -> Result<()> {
             plan.packages[0].package,
             plan.packages[0].bump
         );
+    }
+
+    // Preflight: validate every package before touching changelogs so that a
+    // mismatched version or other plan error aborts without leaving the
+    // workspace half-edited.
+    for step in plan.packages.iter() {
+        preflight_package(workspace, step)?;
+    }
+
+    // Must run before the package loop: `update_package` finalizes Unreleased
+    // into the new version section, so fragments added after would land in the
+    // wrong (new, empty) Unreleased.
+    if args.no_dry_run {
+        let modified = crate::commands::release::plan::generate_changelog_draft(workspace, &plan);
+        if modified.is_empty() {
+            println!(
+                "Note: No changelog entries were merged. Run \
+                `cargo xtask release changelog-preview` manually if needed."
+            );
+        } else {
+            println!("Merged changelog entries into the following files:");
+            for path in &modified {
+                println!("  {}", path.display());
+            }
+        }
+    } else {
+        println!("Dry run: would merge PR changelog entries into CHANGELOG.md / MIGRATING-*.md");
     }
 
     // Make code changes
@@ -134,24 +166,6 @@ pub fn execute_plan(workspace: &Path, args: ApplyPlanArgs) -> Result<()> {
         }
     }
 
-    // Merge PR changelog entries into CHANGELOG.md / MIGRATING-*.md files.
-    if args.no_dry_run {
-        let modified = crate::commands::release::plan::generate_changelog_draft(workspace, &plan);
-        if modified.is_empty() {
-            println!(
-                "Note: No changelog entries were merged. Run \
-                `cargo xtask release changelog-preview` manually if needed."
-            );
-        } else {
-            println!("Merged changelog entries into the following files:");
-            for path in &modified {
-                println!("  {}", path.display());
-            }
-        }
-    } else {
-        println!("Dry run: would merge PR changelog entries into CHANGELOG.md / MIGRATING-*.md");
-    }
-
     // Update release plan file
     let plan_source = serde_json::to_string_pretty(&plan).with_context(|| {
         format!(
@@ -186,6 +200,47 @@ pub fn execute_plan(workspace: &Path, args: ApplyPlanArgs) -> Result<()> {
         println!(
             "Dry run completed. To make changes, run `cargo xrelease execute-plan --no-dry-run`."
         );
+    }
+
+    Ok(())
+}
+
+/// Validate a package against its plan entry without making any changes.
+///
+/// Mirrors the early checks in the per-package bump loop so we can fail before
+/// `generate_changelog_draft` writes to CHANGELOG/MIGRATING files.
+fn preflight_package(workspace: &Path, step: &PackagePlan) -> Result<()> {
+    let package = CargoToml::new(workspace, step.package).with_context(|| {
+        format!(
+            "Couldn't create Cargo.toml in workspace {workspace:?} for {:?}",
+            step.package
+        )
+    })?;
+
+    let current = package.package_version();
+    if current != step.current_version && current != step.new_version {
+        bail!(
+            "The version of package {} has changed in an unexpected way. Cannot continue.",
+            step.package
+        );
+    }
+
+    if let Some(metadata) = package.espressif_metadata()
+        && let Some(Item::Value(forever_unstable)) = metadata.get("forever-unstable")
+    {
+        let forever_unstable = if let Value::Boolean(forever_unstable) = forever_unstable {
+            *forever_unstable.value()
+        } else {
+            log::warn!("Invalid value for 'forever-unstable' in metadata - must be a boolean");
+            true
+        };
+
+        if forever_unstable && step.bump != VersionBump::patch() {
+            bail!(
+                "Cannot bump perma-unstable package {} to a non-patch version",
+                step.package
+            );
+        }
     }
 
     Ok(())
