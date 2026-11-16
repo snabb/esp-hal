@@ -2486,26 +2486,29 @@ pub(crate) mod xarxa {
             // `esp_wifi_internal_free_rx_buffer` which will try to lock an internal mutex. If
             // the mutex is already taken, the function will try to trigger a context switch,
             // which will fail if we are in an interrupt-free context.
-            let mut packet = self.mode.data_queue_rx().with(|queue| queue.pop_front())?;
+            loop {
+                let mut packet = self.mode.data_queue_rx().with(|queue| queue.pop_front())?;
 
-            let data = packet.as_slice_mut();
-            dump_packet_info(data);
+                let data = packet.as_slice_mut();
+                dump_packet_info(data);
 
-            if data.len() > capacity {
-                // Keep the lent buffer for the next frame.
-                warn!(
-                    "Dropping a {} byte frame, the packet buffer holds {} bytes",
-                    data.len(),
-                    capacity
-                );
-                return None;
+                if data.len() > capacity {
+                    // Keep the lent buffer and go on to the next frame: returning `None` tells the
+                    // stack the queue is empty, and nothing would wake it for the frames behind.
+                    warn!(
+                        "Dropping a {} byte frame, the packet buffer holds {} bytes",
+                        data.len(),
+                        capacity
+                    );
+                    continue;
+                }
+
+                let mut buffer = self.rx_buffer.take()?;
+                buffer.set_len(data.len());
+                buffer.copy_from_slice(data);
+
+                return Some(buffer);
             }
-
-            let mut buffer = self.rx_buffer.take()?;
-            buffer.set_len(data.len());
-            buffer.copy_from_slice(data);
-
-            Some(buffer)
         }
 
         fn can_transmit(&mut self) -> bool {
