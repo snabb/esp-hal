@@ -1772,10 +1772,27 @@ pub(super) fn release(bit: u8) {
 /// [`Interface::station()`] or [`Interface::access_point()`] before or after
 /// calling [`WifiController::new()`]. Dropping the interface releases the singleton so it can
 /// be created again.
-#[derive(Debug, PartialEq, Eq, Hash)]
+#[derive(Debug)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct Interface {
     mode: InterfaceType,
+    /// The empty buffer the xarxa stack lent for the next received frame.
+    rx_buffer: Option<xarxa_driver::PacketBuf>,
+}
+
+// An interface is identified by its singleton mode, not by the buffer it holds.
+impl PartialEq for Interface {
+    fn eq(&self, other: &Self) -> bool {
+        self.mode == other.mode
+    }
+}
+
+impl Eq for Interface {}
+
+impl core::hash::Hash for Interface {
+    fn hash<H: core::hash::Hasher>(&self, state: &mut H) {
+        self.mode.hash(state);
+    }
 }
 
 impl Interface {
@@ -1796,6 +1813,7 @@ impl Interface {
         if try_acquire(STA_BIT) {
             Some(Self {
                 mode: InterfaceType::Station,
+                rx_buffer: None,
             })
         } else {
             None
@@ -1821,6 +1839,7 @@ impl Interface {
         if try_acquire(AP_BIT) {
             Some(Self {
                 mode: InterfaceType::AccessPoint,
+                rx_buffer: None,
             })
         } else {
             None
@@ -2419,31 +2438,14 @@ pub(crate) mod embassy_02 {
 }
 
 pub(crate) mod xarxa {
-    use xarxa_driver::{
-        Capabilities,
-        Driver,
-        HardwareAddress,
-        LinkState,
-        NotSupported,
-        PacketBuf,
-        config::PACKET_BUF_SIZE,
-    };
+    use xarxa_driver::{Capabilities, Driver, HardwareAddress, LinkState, NotSupported, PacketBuf};
 
     use super::*;
-
-    /// The largest frame this driver can pass on to the stack.
-    ///
-    /// The packet pool has a fixed buffer size, so a larger configured MTU cannot be used.
-    const XARXA_MTU: usize = if MTU < PACKET_BUF_SIZE {
-        MTU
-    } else {
-        PACKET_BUF_SIZE
-    };
 
     impl Driver for Interface {
         fn capabilities(&self) -> Capabilities {
             let mut caps = Capabilities::default();
-            caps.max_transmission_unit = XARXA_MTU;
+            caps.max_transmission_unit = MTU;
             caps
         }
 
@@ -2466,7 +2468,19 @@ pub(crate) mod xarxa {
             Ok(())
         }
 
+        fn rx_wanted(&mut self) -> usize {
+            usize::from(self.rx_buffer.is_none())
+        }
+
+        fn rx_give(&mut self, buffer: PacketBuf) {
+            debug_assert!(self.rx_buffer.is_none());
+            self.rx_buffer = Some(buffer);
+        }
+
         fn receive(&mut self) -> Option<PacketBuf> {
+            // Without a lent buffer, frames stay queued in the driver until the stack has one.
+            let capacity = self.rx_buffer.as_ref()?.capacity();
+
             // We handle the received data outside of the lock because PacketBuffer::drop must
             // not be called in a critical section. Dropping a PacketBuffer calls
             // `esp_wifi_internal_free_rx_buffer` which will try to lock an internal mutex. If
@@ -2477,18 +2491,17 @@ pub(crate) mod xarxa {
             let data = packet.as_slice_mut();
             dump_packet_info(data);
 
-            if data.len() > PACKET_BUF_SIZE {
+            if data.len() > capacity {
+                // Keep the lent buffer for the next frame.
                 warn!(
                     "Dropping a {} byte frame, the packet buffer holds {} bytes",
                     data.len(),
-                    PACKET_BUF_SIZE
+                    capacity
                 );
                 return None;
             }
 
-            // The pool is shared with the rest of the stack and can be empty. Dropping the
-            // packet is the only option, the hardware does not hold it for us.
-            let mut buffer = PacketBuf::try_new()?;
+            let mut buffer = self.rx_buffer.take()?;
             buffer.set_len(data.len());
             buffer.copy_from_slice(data);
 
